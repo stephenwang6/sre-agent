@@ -27,43 +27,42 @@
 
 ```mermaid
 flowchart TB
-    subgraph L1["① 入口层"]
+    subgraph ENTRY["入口层"]
         CLI["main.py CLI<br/>seed / run / reset / all"]
         CFG["config.py<br/>环境变量 + .env"]
-        SCEN["scenarios/seed_topology.py<br/>拓扑搭建 + 异常注入 / 清理"]
+        SCEN["seed_topology.py<br/>拓扑搭建 + 异常注入"]
     end
 
-    subgraph L2["② Agent 运行时"]
-        RT["runtime.py · AgentRuntime<br/>ReAct 主循环<br/>think → tool_calls → observe"]
-        EXEC["runtime.py · ToolExecutor<br/>等级校验 → 审批 → 执行"]
-        subgraph BRAINS["②′ Brain 决策层（可插拔）"]
-            LOCAL["LocalPolicyBrain<br/>确定性 SRE Runbook"]
-            LLM["OpenAICompatibleBrain<br/>DeepSeek / Qwen / Moonshot / OpenAI"]
-        end
+    subgraph CORE["Agent 运行时"]
+        RT["AgentRuntime<br/>ReAct 主循环<br/>think -> tool_calls -> observe"]
+        EXEC["ToolExecutor<br/>等级校验 -> 审批 -> 执行"]
     end
 
-    subgraph L3["③ 工具层"]
-        REG["tools.py · Tool Registry<br/>11 个工具 + OpenAI JSON Schema"]
-        READ["发现 / 诊断（read）<br/>7 个工具"]
-        ACT["处置（write / dangerous）<br/>4 个工具"]
+    subgraph BRAINS["Brain 决策层 - 可插拔"]
+        LOCAL["LocalPolicyBrain<br/>确定性 SRE Runbook"]
+        LLM["OpenAICompatibleBrain<br/>任意 OpenAI 兼容模型"]
     end
 
-    subgraph L4["④ 被运维对象"]
+    subgraph TOOLS["工具层"]
+        REG["Tool Registry<br/>11 个工具 + JSON Schema"]
+        READ["发现 / 诊断工具<br/>read x7"]
+        ACT["处置工具<br/>write / dangerous x4"]
+    end
+
+    subgraph OPS["被运维对象"]
         NB["NetBox REST API<br/>DCIM / IPAM / Journal"]
-        DK["Docker CLI<br/>netbox-docker-* 容器"]
+        DK["Docker CLI<br/>netbox-docker 容器"]
     end
 
-    subgraph L5["⑤ 产出"]
-        REP["reports/sre_report_YYYYmmdd_HHMMSS.md<br/>工具调用轨迹 + 闭环报告"]
-    end
-
-    LLMAPI(["外部 LLM API<br/>OpenAI 兼容 /chat/completions"])
+    REP["reports 报告<br/>工具轨迹 + 闭环报告"]
+    LLMAPI["外部 LLM API"]
 
     CLI --> RT
     CLI --> SCEN
-    CFG -. 配置 .-> RT
+    CFG --> RT
     SCEN --> NB
-    RT <--> BRAINS
+    RT --> LOCAL
+    RT --> LLM
     RT --> EXEC
     EXEC --> REG
     REG --> READ
@@ -72,9 +71,36 @@ flowchart TB
     READ --> DK
     ACT --> NB
     ACT --> DK
-    LLM -. HTTPS .-> LLMAPI
+    LLM --> LLMAPI
     RT --> REP
 ```
+
+<details>
+<summary>文本版架构图（Mermaid 无法渲染时使用）</summary>
+
+```text
+入口层
+  main.py CLI (seed / run / reset / all)
+  config.py (.env)          seed_topology.py (场景注入 / 清理)
+        |
+        v
+Agent 运行时  runtime.py
+  AgentRuntime : think -> tool_calls -> observe -> ...
+  ToolExecutor : 安全等级校验 -> 审批 -> 执行
+  Brain 决策层 : LocalPolicyBrain | OpenAICompatibleBrain
+        |
+        v
+工具层  tools.py Tool Registry (11 个工具)
+  发现 / 诊断 (read) x7          处置 (write / dangerous) x4
+        |                                |
+        v                                v
+  NetBox REST API                   Docker CLI
+  DCIM / IPAM / Journal             netbox-docker-* 容器
+
+产出: reports/sre_report_<timestamp>.md (工具轨迹 + 闭环报告)
+```
+
+</details>
 
 > 部署上，Agent 进程独立于 NetBox 运行；只需能访问 `NETBOX_URL`，并在使用容器类工具的主机上可执行
 > `docker` CLI（默认只允许操作 `netbox-docker-*` 前缀的容器）。
@@ -88,30 +114,30 @@ sequenceDiagram
     participant RT as AgentRuntime
     participant BR as Brain
     participant EX as ToolExecutor
-    participant TL as Tool Registry
+    participant TL as ToolRegistry
     participant NB as NetBox / Docker
-    participant FS as reports/
+    participant FS as reports
 
     CLI->>RT: run(TASK)
     RT->>RT: messages = [system, user]
     loop step 1..max_steps
         RT->>BR: decide(messages, tool_schemas())
-        alt Brain 返回 tool_calls
+        alt 返回 tool_calls
             BR-->>RT: BrainDecision(tool_calls)
-            loop 每个 tool_call（同批次顺序执行）
+            loop 逐个调用工具
                 RT->>EX: execute(call)
                 opt write / dangerous
                     EX->>CLI: approval_callback(proposal)
                     CLI-->>EX: 批准 / 拒绝
                 end
-                EX->>TL: get_tool + handler(arguments, ctx)
+                EX->>TL: get_tool + handler(args, ctx)
                 TL->>NB: REST 请求 / docker CLI
                 NB-->>TL: JSON 结果
                 TL-->>EX: result
                 EX-->>RT: result
                 RT->>RT: 追加 role=tool 消息
             end
-        else Brain 返回最终答复
+        else 返回最终答复
             BR-->>RT: BrainDecision(content)
             RT->>FS: 保存工具轨迹 + 闭环报告
             RT-->>CLI: final_content
